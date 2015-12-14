@@ -52,8 +52,7 @@
 
 /* list of last checks to perform, depending on config options */
 #define LSTCHK_CAP_BIND	0x00000001	/* check that we can bind to any port */
-#define LSTCHK_CTTPROXY	0x00000002	/* check that tproxy is enabled */
-#define LSTCHK_NETADM	0x00000004	/* check that we have CAP_NET_ADMIN */
+#define LSTCHK_NETADM	0x00000002	/* check that we have CAP_NET_ADMIN */
 
 /* Global tuning options */
 /* available polling mechanisms */
@@ -127,9 +126,11 @@ struct global {
 	char *chroot;
 	char *pidfile;
 	char *node, *desc;		/* node name & description */
-	char *log_tag;                  /* name for syslog */
+	struct chunk log_tag;           /* name for syslog */
 	struct list logsrvs;
 	char *log_send_hostname;   /* set hostname in syslog header */
+	char *server_state_base;   /* path to a directory where server state files can be found */
+	char *server_state_file;   /* path to the file where server states are loaded from */
 	struct {
 		int maxpollevents; /* max number of poll events at once */
 		int maxaccept;     /* max number of consecutive accept() */
@@ -179,10 +180,13 @@ struct global {
 	struct {
 		void *atlasimgptr;
 		char *jsonpath;
+		char *cookiename;
+		size_t cookienamelen;
 		da_atlas_t atlas;
 		da_evidence_id_t useragentid;
 		da_severity_t loglevel;
 		char separator;
+		unsigned char daset:1;
 	} deviceatlas;
 #endif
 #ifdef USE_51DEGREES
@@ -190,8 +194,15 @@ struct global {
 		char property_separator;    /* the separator to use in the response for the values. this is taken from 51degrees-property-separator from config. */
 		struct list property_names; /* list of properties to load into the data set. this is taken from 51degrees-property-name-list from config. */
 		char *data_file_path;
+		int header_count; /* number of HTTP headers related to device detection. */
+		struct chunk *header_names; /* array of HTTP header names. */
 #ifdef FIFTYONEDEGREES_H_PATTERN_INCLUDED
 		fiftyoneDegreesDataSet data_set; /* data set used with the pattern detection method. */
+		fiftyoneDegreesWorksetPool *pool; /* pool of worksets to avoid creating a new one for each request. */
+#endif
+#ifdef FIFTYONEDEGREES_H_TRIE_INCLUDED
+		int32_t *header_offsets; /* offsets to the HTTP header name string. */
+		fiftyoneDegreesDeviceOffsets device_offsets; /* Memory used for device offsets. */
 #endif
 		int cache_size;
 	} _51degrees;

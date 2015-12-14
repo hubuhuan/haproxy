@@ -73,13 +73,24 @@ enum srv_state {
  *   state_str = (state & MAINT) ? "MAINT" : (state & DRAIN) : "DRAIN" : "READY"
  */
 enum srv_admin {
-	SRV_ADMF_FMAINT    = 0x1,        /* the server was explicitly forced into maintenance */
-	SRV_ADMF_IMAINT    = 0x2,        /* the server has inherited the maintenance status from a tracked server */
-	SRV_ADMF_MAINT     = 0x3,        /* mask to check if any maintenance flag is present */
-	SRV_ADMF_FDRAIN    = 0x4,        /* the server was explicitly forced into drain state */
-	SRV_ADMF_IDRAIN    = 0x8,        /* the server has inherited the drain status from a tracked server */
-	SRV_ADMF_DRAIN     = 0xC,        /* mask to check if any drain flag is present */
+	SRV_ADMF_FMAINT    = 0x01,        /* the server was explicitly forced into maintenance */
+	SRV_ADMF_IMAINT    = 0x02,        /* the server has inherited the maintenance status from a tracked server */
+	SRV_ADMF_MAINT     = 0x03,        /* mask to check if any maintenance flag is present */
+	SRV_ADMF_CMAINT    = 0x04,        /* the server is in maintenance because of the configuration */
+	SRV_ADMF_FDRAIN    = 0x08,        /* the server was explicitly forced into drain state */
+	SRV_ADMF_IDRAIN    = 0x10,        /* the server has inherited the drain status from a tracked server */
+	SRV_ADMF_DRAIN     = 0x18,        /* mask to check if any drain flag is present */
 };
+
+/* server-state-file version */
+#define SRV_STATE_FILE_VERSION 1
+#define SRV_STATE_FILE_VERSION_MIN 1
+#define SRV_STATE_FILE_VERSION_MAX 1
+#define SRV_STATE_FILE_FIELD_NAMES "be_id be_name srv_id srv_name srv_addr srv_op_state srv_admin_state srv_uweight srv_iweight srv_time_since_last_change srv_check_status srv_check_result srv_check_health srv_check_state srv_agent_state bk_f_forced_id srv_f_forced_id"
+#define SRV_STATE_FILE_MAX_FIELDS 18
+#define SRV_STATE_FILE_NB_FIELDS_VERSION_1 18
+#define SRV_STATE_LINE_MAXLEN 512
+
 
 /* server flags */
 #define SRV_F_BACKUP       0x0001        /* this server is a backup server */
@@ -205,6 +216,7 @@ struct server {
 	time_t last_change;			/* last time, when the state was changed */
 
 	int puid;				/* proxy-unique server ID, used for SNMP, and "first" LB algo */
+	int tcp_ut;                             /* for TCP, user timeout */
 
 	struct check check;                     /* health-check specific configuration */
 	struct check agent;                     /* agent specific configuration */

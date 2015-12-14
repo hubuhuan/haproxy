@@ -250,8 +250,8 @@ static int peer_prepare_updatemsg(struct stksess *ts, struct shared_table *st, c
 	/* construct message */
 
 	/* check if we need to send the update identifer */
-	if (st->last_pushed && ts->upd.key > st->last_pushed && (ts->upd.key - st->last_pushed) == 1) {
-		use_identifier = 0;
+	if (!st->last_pushed || ts->upd.key < st->last_pushed || ((ts->upd.key - st->last_pushed) != 1)) {
+		use_identifier = 1;
 	}
 
 	/* encode update identifier if needed */
@@ -262,14 +262,14 @@ static int peer_prepare_updatemsg(struct stksess *ts, struct shared_table *st, c
 	}
 
 	/* encode the key */
-	if (st->table->type == STKTABLE_TYPE_STRING) {
+	if (st->table->type == SMP_T_STR) {
 		int stlen = strlen((char *)ts->key.key);
 
 		intencode(stlen, &cursor);
 		memcpy(cursor, ts->key.key, stlen);
 		cursor += stlen;
 	}
-	else if (st->table->type == STKTABLE_TYPE_INTEGER) {
+	else if (st->table->type == SMP_T_SINT) {
 		netinteger = htonl(*((uint32_t *)ts->key.key));
 		memcpy(cursor, &netinteger, sizeof(netinteger));
 		cursor += sizeof(netinteger);
@@ -417,7 +417,7 @@ static int peer_prepare_ackmsg(struct shared_table *st, char *msg, size_t size)
 	char *cursor, *datamsg;
 	uint32_t netinteger;
 
-	cursor = datamsg = trash.str + 2 + 5;
+	cursor = datamsg = msg + 2 + 5;
 
 	intencode(st->remote_id, &cursor);
 	netinteger = htonl(st->last_get);
@@ -429,7 +429,7 @@ static int peer_prepare_ackmsg(struct shared_table *st, char *msg, size_t size)
 
 	/*  prepare message header */
 	msg[0] = PEER_MSG_CLASS_STICKTABLE;
-	msg[1] = PEER_MSG_STKT_DEFINE;
+	msg[1] = PEER_MSG_STKT_ACK;
 	cursor = &msg[2];
 	intencode(datalen, &cursor);
 
@@ -457,6 +457,8 @@ static void peer_session_release(struct appctx *appctx)
 	/* peer session identified */
 	if (peer) {
 		if (peer->stream == s) {
+			/* Re-init current table pointers to force announcement on re-connect */
+			peer->remote_table = peer->last_local_table = NULL;
 			peer->stream = NULL;
 			peer->appctx = NULL;
 			if (peer->flags & PEER_F_LEARN_ASSIGN) {
@@ -1028,7 +1030,7 @@ switchstate:
 						if (!newts)
 							goto ignore_msg;
 
-						if (st->table->type == STKTABLE_TYPE_STRING) {
+						if (st->table->type == SMP_T_STR) {
 							unsigned int to_read, to_store;
 
 							to_read = intdecode(&msg_cur, msg_end);
@@ -1050,7 +1052,7 @@ switchstate:
 							newts->key.key[to_store] = 0;
 							msg_cur += to_read;
 						}
-						else if (st->table->type == STKTABLE_TYPE_INTEGER) {
+						else if (st->table->type == SMP_T_SINT) {
 							unsigned int netinteger;
 
 							if (msg_cur + sizeof(netinteger) > msg_end) {
@@ -1763,9 +1765,9 @@ static struct task *process_peer_sync(struct task * task)
 	if (!peers->peers_fe) {
 		/* this one was never started, kill it */
 		signal_unregister_handler(peers->sighandler);
-		peers->sync_task = NULL;
 		task_delete(peers->sync_task);
 		task_free(peers->sync_task);
+		peers->sync_task = NULL;
 		return NULL;
 	}
 

@@ -92,6 +92,8 @@ enum {
 	STAT_CLI_O_POOLS,    /* dump memory pools */
 	STAT_CLI_O_TLSK,     /* list all TLS ticket keys references */
 	STAT_CLI_O_RESOLVERS,/* dump a resolver's section nameservers counters */
+	STAT_CLI_O_SERVERS_STATE, /* dump server state and changing information */
+	STAT_CLI_O_BACKEND,  /* dump backend list */
 };
 
 /* Actions available for the stats admin forms */
@@ -127,7 +129,9 @@ enum {
 	ST_ADM_ACTION_START,
 };
 
+static int stats_dump_backend_to_buffer(struct stream_interface *si);
 static int stats_dump_info_to_buffer(struct stream_interface *si);
+static int stats_dump_servers_state_to_buffer(struct stream_interface *si);
 static int stats_dump_pools_to_buffer(struct stream_interface *si);
 static int stats_dump_full_sess_to_buffer(struct stream_interface *si, struct stream *sess);
 static int stats_dump_sess_to_buffer(struct stream_interface *si);
@@ -144,11 +148,15 @@ static int stats_tlskeys_list(struct stream_interface *si);
 #endif
 static void cli_release_handler(struct appctx *appctx);
 
+static void dump_servers_state(struct proxy *backend, struct chunk *buf);
+
 /*
  * cli_io_handler()
  *     -> stats_dump_sess_to_buffer()     // "show sess"
  *     -> stats_dump_errors_to_buffer()   // "show errors"
  *     -> stats_dump_info_to_buffer()     // "show info"
+ *     -> stats_dump_backend_to_buffer()  // "show backend"
+ *     -> stats_dump_servers_state_to_buffer() // "show servers state [<backend name>]"
  *     -> stats_dump_stat_to_buffer()     // "show stat"
  *        -> stats_dump_resolvers_to_buffer() // "show stat resolver <id>"
  *        -> stats_dump_csv_header()
@@ -182,12 +190,14 @@ static const char stats_sock_usage_msg[] =
 	"  help           : this message\n"
 	"  prompt         : toggle interactive mode with prompt\n"
 	"  quit           : disconnect\n"
+	"  show backend   : list backends in the current running config\n"
 	"  show info      : report information about the running process\n"
 	"  show pools     : report information about the memory pools usage\n"
 	"  show stat      : report counters for each proxy and server\n"
 	"  show errors    : report last request and response errors for each proxy\n"
 	"  show sess [id] : report the list of current sessions or dump this session\n"
 	"  show table [id]: report table usage stats or dump this table's contents\n"
+	"  show servers state [id]: dump volatile server information (for backend <id>)\n"
 	"  get weight     : report a server's current weight\n"
 	"  set weight     : change a server's weight\n"
 	"  set server     : change a server's state, weight or address\n"
@@ -320,7 +330,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 					return -1;
 				}
 
-				if (kw->parse(args, cur_arg, curpx, bind_conf, err) != 0) {
+				if (kw->parse(args, cur_arg, global.stats_fe, bind_conf, err) != 0) {
 					if (err && *err)
 						memprintf(err, "'%s %s' : '%s'", args[0], args[1], *err);
 					else
@@ -584,20 +594,20 @@ static int stats_dump_table_entry_to_buffer(struct chunk *msg, struct stream_int
 
 	chunk_appendf(msg, "%p:", entry);
 
-	if (proxy->table.type == STKTABLE_TYPE_IP) {
+	if (proxy->table.type == SMP_T_IPV4) {
 		char addr[INET_ADDRSTRLEN];
 		inet_ntop(AF_INET, (const void *)&entry->key.key, addr, sizeof(addr));
 		chunk_appendf(msg, " key=%s", addr);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_IPV6) {
+	else if (proxy->table.type == SMP_T_IPV6) {
 		char addr[INET6_ADDRSTRLEN];
 		inet_ntop(AF_INET6, (const void *)&entry->key.key, addr, sizeof(addr));
 		chunk_appendf(msg, " key=%s", addr);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_INTEGER) {
+	else if (proxy->table.type == SMP_T_SINT) {
 		chunk_appendf(msg, " key=%u", *(unsigned int *)entry->key.key);
 	}
-	else if (proxy->table.type == STKTABLE_TYPE_STRING) {
+	else if (proxy->table.type == SMP_T_STR) {
 		chunk_appendf(msg, " key=");
 		dump_text(msg, (const char *)entry->key.key, proxy->table.key_size);
 	}
@@ -669,15 +679,15 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 	}
 
 	switch (px->table.type) {
-	case STKTABLE_TYPE_IP:
+	case SMP_T_IPV4:
 		uint32_key = htonl(inetaddr_host(args[4]));
 		static_table_key->key = &uint32_key;
 		break;
-	case STKTABLE_TYPE_IPV6:
+	case SMP_T_IPV6:
 		inet_pton(AF_INET6, args[4], ip6_key);
 		static_table_key->key = &ip6_key;
 		break;
-	case STKTABLE_TYPE_INTEGER:
+	case SMP_T_SINT:
 		{
 			char *endptr;
 			unsigned long val;
@@ -695,7 +705,7 @@ static void stats_sock_table_key_request(struct stream_interface *si, char **arg
 			break;
 		}
 		break;
-	case STKTABLE_TYPE_STRING:
+	case SMP_T_STR:
 		static_table_key->key = args[4];
 		static_table_key->key_len = strlen(args[4]);
 		break;
@@ -1148,27 +1158,27 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 	appctx->ctx.stats.scope_len = 0;
 	appctx->ctx.stats.flags = 0;
 	if (strcmp(args[0], "show") == 0) {
-		if (strcmp(args[1], "stat") == 0) {
+		if (strcmp(args[1], "backend") == 0) {
+			appctx->st2 = STAT_ST_INIT;
+			appctx->st0 = STAT_CLI_O_BACKEND;
+		}
+		 else if (strcmp(args[1], "stat") == 0) {
 			if (strcmp(args[2], "resolvers") == 0) {
 				struct dns_resolvers *presolvers;
 
-				if (!*args[3]) {
-					appctx->ctx.cli.msg = "Missing resolver section identifier.\n";
-					appctx->st0 = STAT_CLI_PRINT;
-					return 1;
-				}
-
-				appctx->ctx.resolvers.ptr = NULL;
-				list_for_each_entry(presolvers, &dns_resolvers, list) {
-					if (strcmp(presolvers->id, args[3]) == 0) {
-						appctx->ctx.resolvers.ptr = presolvers;
-						break;
+				if (*args[3]) {
+					appctx->ctx.resolvers.ptr = NULL;
+					list_for_each_entry(presolvers, &dns_resolvers, list) {
+						if (strcmp(presolvers->id, args[3]) == 0) {
+							appctx->ctx.resolvers.ptr = presolvers;
+							break;
+						}
 					}
-				}
-				if (appctx->ctx.resolvers.ptr == NULL) {
-					appctx->ctx.cli.msg = "Can't find resolvers section.\n";
-					appctx->st0 = STAT_CLI_PRINT;
-					return 1;
+					if (appctx->ctx.resolvers.ptr == NULL) {
+						appctx->ctx.cli.msg = "Can't find that resolvers section\n";
+						appctx->st0 = STAT_CLI_PRINT;
+						return 1;
+					}
 				}
 
 				appctx->st2 = STAT_ST_INIT;
@@ -1188,6 +1198,24 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 		else if (strcmp(args[1], "info") == 0) {
 			appctx->st2 = STAT_ST_INIT;
 			appctx->st0 = STAT_CLI_O_INFO; // stats_dump_info_to_buffer
+		}
+		else if (strcmp(args[1], "servers") == 0 && strcmp(args[2], "state") == 0) {
+			appctx->ctx.server_state.backend = NULL;
+
+			/* check if a backend name has been provided */
+			if (*args[3]) {
+				/* read server state from local file */
+				appctx->ctx.server_state.backend = proxy_be_by_name(args[3]);
+
+				if (appctx->ctx.server_state.backend == NULL) {
+					appctx->ctx.cli.msg = "Can't find backend.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+			}
+			appctx->st2 = STAT_ST_INIT;
+			appctx->st0 = STAT_CLI_O_SERVERS_STATE; // stats_dump_servers_state_to_buffer
+			return 1;
 		}
 		else if (strcmp(args[1], "pools") == 0) {
 			appctx->st2 = STAT_ST_INIT;
@@ -1618,6 +1646,38 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 
 				return 1;
 			}
+			else if (strcmp(args[2], "server") == 0) {
+				struct server *sv;
+				int v;
+
+				sv = expect_server_admin(s, si, args[3]);
+				if (!sv)
+					return 1;
+
+				if (!*args[4]) {
+					appctx->ctx.cli.msg = "Integer value expected.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+
+				v = atoi(args[4]);
+				if (v < 0) {
+					appctx->ctx.cli.msg = "Value out of range.\n";
+					appctx->st0 = STAT_CLI_PRINT;
+					return 1;
+				}
+
+				if (sv->maxconn == sv->minconn) { // static maxconn
+					sv->maxconn = sv->minconn = v;
+				} else { // dynamic maxconn
+					sv->maxconn = v;
+				}
+
+				if (may_dequeue_tasks(sv, sv->proxy))
+					process_srv_queue(sv);
+
+				return 1;
+			}
 			else if (strcmp(args[2], "global") == 0) {
 				int v;
 
@@ -1653,7 +1713,7 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 				return 1;
 			}
 			else {
-				appctx->ctx.cli.msg = "'set maxconn' only supports 'frontend' and 'global'.\n";
+				appctx->ctx.cli.msg = "'set maxconn' only supports 'frontend', 'server', and 'global'.\n";
 				appctx->st0 = STAT_CLI_PRINT;
 				return 1;
 			}
@@ -1775,6 +1835,12 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 			else if (strcmp(args[2], "http-compression") == 0) {
 				if (strcmp(args[3], "global") == 0) {
 					int v;
+
+					if (strm_li(s)->bind_conf->level < ACCESS_LVL_ADMIN) {
+						appctx->ctx.cli.msg = stats_permission_denied_msg;
+						appctx->st0 = STAT_CLI_PRINT;
+						return 1;
+					}
 
 					if (!*args[4]) {
 						appctx->ctx.cli.msg = "Expects a maximum input byte rate in kB/s.\n";
@@ -1933,8 +1999,8 @@ static int stats_sock_parse_request(struct stream_interface *si, char *line)
 					return 1;
 				}
 
-				memcpy(appctx->ctx.tlskeys.ref->tlskeys + 2 % TLS_TICKETS_NO, trash.str, trash.len);
-				appctx->ctx.tlskeys.ref->tls_ticket_enc_index = appctx->ctx.tlskeys.ref->tls_ticket_enc_index + 1 % TLS_TICKETS_NO;
+				memcpy(appctx->ctx.tlskeys.ref->tlskeys + ((appctx->ctx.tlskeys.ref->tls_ticket_enc_index + 2) % TLS_TICKETS_NO), trash.str, trash.len);
+				appctx->ctx.tlskeys.ref->tls_ticket_enc_index = (appctx->ctx.tlskeys.ref->tls_ticket_enc_index + 1) % TLS_TICKETS_NO;
 
 				appctx->ctx.cli.msg = "TLS ticket key updated!";
 				appctx->st0 = STAT_CLI_PRINT;
@@ -2450,14 +2516,10 @@ static void cli_io_handler(struct appctx *appctx)
 			bo_skip(si_oc(si), reql);
 			req->flags |= CF_READ_DONTWAIT; /* we plan to read small requests */
 		}
-		else {	/* output functions: first check if the output buffer is closed then abort */
-			if (res->flags & (CF_SHUTR_NOW|CF_SHUTR)) {
-				cli_release_handler(appctx);
-				appctx->st0 = STAT_CLI_END;
-				continue;
-			}
-
+		else {	/* output functions */
 			switch (appctx->st0) {
+			case STAT_CLI_PROMPT:
+				break;
 			case STAT_CLI_PRINT:
 				if (bi_putstr(si_ic(si), appctx->ctx.cli.msg) != -1)
 					appctx->st0 = STAT_CLI_PROMPT;
@@ -2472,8 +2534,16 @@ static void cli_io_handler(struct appctx *appctx)
 				else
 					si_applet_cant_put(si);
 				break;
+			case STAT_CLI_O_BACKEND:
+				if (stats_dump_backend_to_buffer(si))
+					appctx->st0 = STAT_CLI_PROMPT;
+				break;
 			case STAT_CLI_O_INFO:
 				if (stats_dump_info_to_buffer(si))
+					appctx->st0 = STAT_CLI_PROMPT;
+				break;
+			case STAT_CLI_O_SERVERS_STATE:
+				if (stats_dump_servers_state_to_buffer(si))
 					appctx->st0 = STAT_CLI_PROMPT;
 				break;
 			case STAT_CLI_O_STAT:
@@ -2520,8 +2590,7 @@ static void cli_io_handler(struct appctx *appctx)
 				break;
 #endif
 			default: /* abnormal state */
-				cli_release_handler(appctx);
-				appctx->st0 = STAT_CLI_PROMPT;
+				si->flags |= SI_FL_ERR;
 				break;
 			}
 
@@ -2552,7 +2621,7 @@ static void cli_io_handler(struct appctx *appctx)
 		}
 	}
 
-	if ((res->flags & CF_SHUTR) && (si->state == SI_ST_EST) && (appctx->st0 != STAT_CLI_GETREQ)) {
+	if ((res->flags & CF_SHUTR) && (si->state == SI_ST_EST)) {
 		DPRINTF(stderr, "%s@%d: si to buf closed. req=%08x, res=%08x, st=%d\n",
 			__FUNCTION__, __LINE__, req->flags, res->flags, si->state);
 		/* Other side has closed, let's abort if we have no more processing to do
@@ -2609,6 +2678,9 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 	             "Uptime: %dd %dh%02dm%02ds\n"
 	             "Uptime_sec: %d\n"
 	             "Memmax_MB: %d\n"
+		     "PoolAlloc_MB: %d\n"
+		     "PoolUsed_MB: %d\n"
+		     "PoolFailed: %d\n"
 	             "Ulimit-n: %d\n"
 	             "Maxsock: %d\n"
 	             "Maxconn: %d\n"
@@ -2661,6 +2733,9 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 	             up / 86400, (up % 86400) / 3600, (up % 3600) / 60, (up % 60),
 	             up,
 	             global.rlimit_memmax,
+		     (int)(pool_total_allocated() / 1048576L),
+		     (int)(pool_total_used() / 1048576L),
+		     pool_total_failures(),
 	             global.rlimit_nofile,
 	             global.maxsock, global.maxconn, global.hardmaxconn,
 	             actconn, totalconn, global.req_count,
@@ -2685,6 +2760,124 @@ static int stats_dump_info_to_buffer(struct stream_interface *si)
 	             nb_tasks_cur, run_queue_cur, idle_pct,
 	             global.node, global.desc ? global.desc : ""
 	             );
+
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
+		return 0;
+	}
+
+	return 1;
+}
+
+/* dumps server state information into <buf> for all the servers found in <backend>
+ * These information are all the parameters which may change during HAProxy runtime.
+ * By default, we only export to the last known server state file format.
+ * These information can be used at next startup to recover same level of server state.
+ */
+static void dump_servers_state(struct proxy *backend, struct chunk *buf)
+{
+	struct server *srv;
+	char srv_addr[INET6_ADDRSTRLEN + 1];
+	time_t srv_time_since_last_change;
+	int bk_f_forced_id, srv_f_forced_id;
+
+	/* we don't want to report any state if the backend is not enabled on this process */
+	if (backend->bind_proc && !(backend->bind_proc & (1UL << (relative_pid - 1))))
+		return;
+
+	srv = backend->srv;
+
+	while (srv) {
+		srv_addr[0] = '\0';
+		srv_time_since_last_change = 0;
+		bk_f_forced_id = 0;
+		srv_f_forced_id = 0;
+
+		switch (srv->addr.ss_family) {
+			case AF_INET:
+				inet_ntop(srv->addr.ss_family, &((struct sockaddr_in *)&srv->addr)->sin_addr,
+					  srv_addr, INET_ADDRSTRLEN + 1);
+				break;
+			case AF_INET6:
+				inet_ntop(srv->addr.ss_family, &((struct sockaddr_in6 *)&srv->addr)->sin6_addr,
+					  srv_addr, INET6_ADDRSTRLEN + 1);
+				break;
+		}
+		srv_time_since_last_change = now.tv_sec - srv->last_change;
+		bk_f_forced_id = backend->options & PR_O_FORCED_ID ? 1 : 0;
+		srv_f_forced_id = srv->flags & SRV_F_FORCED_ID ? 1 : 0;
+
+		chunk_appendf(buf,
+				"%d %s "
+				"%d %s %s "
+				"%d %d %d %d %ld "
+				"%d %d %d %d %d "
+				"%d %d"
+				"\n",
+				backend->uuid, backend->id,
+				srv->puid, srv->id, srv_addr,
+				srv->state, srv->admin, srv->uweight, srv->iweight, srv_time_since_last_change,
+				srv->check.status, srv->check.result, srv->check.health, srv->check.state, srv->agent.state,
+				bk_f_forced_id, srv_f_forced_id);
+
+		srv = srv->next;
+	}
+}
+
+/* Parses backend list and simply report backend names */
+static int stats_dump_backend_to_buffer(struct stream_interface *si)
+{
+	extern struct proxy *proxy;
+	struct proxy *curproxy;
+
+	chunk_reset(&trash);
+	chunk_printf(&trash, "# name\n");
+
+	for (curproxy = proxy; curproxy != NULL; curproxy = curproxy->next) {
+		/* looking for backends only */
+		if (!(curproxy->cap & PR_CAP_BE))
+			continue;
+
+		/* we don't want to list a backend which is bound to this process */
+		if (curproxy->bind_proc && !(curproxy->bind_proc & (1UL << (relative_pid - 1))))
+			continue;
+
+		chunk_appendf(&trash, "%s\n", curproxy->id);
+	}
+
+	if (bi_putchk(si_ic(si), &trash) == -1) {
+		si_applet_cant_put(si);
+		return 0;
+	}
+
+	return 1;
+}
+
+/* Parses backend list or simply use backend name provided by the user to return
+ * states of servers to stdout.
+ */
+static int stats_dump_servers_state_to_buffer(struct stream_interface *si)
+{
+	struct appctx *appctx = __objt_appctx(si->end);
+	extern struct proxy *proxy;
+	struct proxy *curproxy;
+
+	chunk_reset(&trash);
+
+	chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
+
+	if (appctx->ctx.server_state.backend) {
+		dump_servers_state(appctx->ctx.server_state.backend, &trash);
+	}
+	else {
+		for (curproxy = proxy; curproxy != NULL; curproxy = curproxy->next) {
+			/* servers are only in backends */
+			if (!(curproxy->cap & PR_CAP_BE))
+				continue;
+
+			dump_servers_state(curproxy, &trash);
+		}
+	}
 
 	if (bi_putchk(si_ic(si), &trash) == -1) {
 		si_applet_cant_put(si);
@@ -5628,10 +5821,10 @@ static int stats_map_lookup(struct stream_interface *si)
 			chunk_reset(&trash);
 
 			/* execute pattern matching */
-			sample.type = SMP_T_STR;
+			sample.data.type = SMP_T_STR;
 			sample.flags |= SMP_F_CONST;
-			sample.data.str.len = appctx->ctx.map.chunk.len;
-			sample.data.str.str = appctx->ctx.map.chunk.str;
+			sample.data.u.str.len = appctx->ctx.map.chunk.len;
+			sample.data.u.str.str = appctx->ctx.map.chunk.str;
 			if (appctx->ctx.map.expr->pat_head->match &&
 			    sample_convert(&sample, appctx->ctx.map.expr->pat_head->expect_type))
 				pat = appctx->ctx.map.expr->pat_head->match(&sample, appctx->ctx.map.expr, 1);
@@ -5691,9 +5884,9 @@ static int stats_map_lookup(struct stream_interface *si)
 
 				/* display return value */
 				if (appctx->ctx.map.display_flags == PAT_REF_MAP) {
-					if (pat->smp && pat->ref && pat->ref->sample)
-						chunk_appendf(&trash, ", value=\"%s\", type=\"%s\"",
-						              pat->ref->sample, smp_to_type[pat->smp->type]);
+					if (pat->data && pat->ref && pat->ref->sample)
+						chunk_appendf(&trash, ", value=\"%s\", type=\"%s\"", pat->ref->sample,
+						              smp_to_type[pat->data->type]);
 					else
 						chunk_appendf(&trash, ", value=none");
 				}
@@ -5853,8 +6046,7 @@ static int stats_dump_sess_to_buffer(struct stream_interface *si)
 			chunk_appendf(&trash,
 				     "%p: proto=%s",
 				     curr_sess,
-				     strm_li(curr_sess)->proto->name);
-
+				     strm_li(curr_sess) ? strm_li(curr_sess)->proto->name : "?");
 
 			conn = objt_conn(strm_orig(curr_sess));
 			switch (conn ? addr_to_str(&conn->addr.from, pn, sizeof(pn)) : AF_UNSPEC) {
@@ -6009,9 +6201,11 @@ static void cli_release_handler(struct appctx *appctx)
 	}
 	else if (appctx->st0 == STAT_CLI_PRINT_FREE) {
 		free(appctx->ctx.cli.err);
+		appctx->ctx.cli.err = NULL;
 	}
 	else if (appctx->st0 == STAT_CLI_O_MLOOK) {
 		free(appctx->ctx.map.chunk.str);
+		appctx->ctx.map.chunk.str = NULL;
 	}
 }
 
@@ -6250,23 +6444,33 @@ static int stats_dump_resolvers_to_buffer(struct stream_interface *si)
 		/* fall through */
 
 	case STAT_ST_LIST:
-		presolvers = appctx->ctx.resolvers.ptr;
-		chunk_appendf(&trash, "Resolvers section %s\n", presolvers->id);
-		list_for_each_entry(pnameserver, &presolvers->nameserver_list, list) {
-			chunk_appendf(&trash, " nameserver %s:\n", pnameserver->id);
-			chunk_appendf(&trash, "  sent: %ld\n", pnameserver->counters.sent);
-			chunk_appendf(&trash, "  valid: %ld\n", pnameserver->counters.valid);
-			chunk_appendf(&trash, "  update: %ld\n", pnameserver->counters.update);
-			chunk_appendf(&trash, "  cname: %ld\n", pnameserver->counters.cname);
-			chunk_appendf(&trash, "  cname_error: %ld\n", pnameserver->counters.cname_error);
-			chunk_appendf(&trash, "  any_err: %ld\n", pnameserver->counters.any_err);
-			chunk_appendf(&trash, "  nx: %ld\n", pnameserver->counters.nx);
-			chunk_appendf(&trash, "  timeout: %ld\n", pnameserver->counters.timeout);
-			chunk_appendf(&trash, "  refused: %ld\n", pnameserver->counters.refused);
-			chunk_appendf(&trash, "  other: %ld\n", pnameserver->counters.other);
-			chunk_appendf(&trash, "  invalid: %ld\n", pnameserver->counters.invalid);
-			chunk_appendf(&trash, "  too_big: %ld\n", pnameserver->counters.too_big);
-			chunk_appendf(&trash, "  outdated: %ld\n", pnameserver->counters.outdated);
+		if (LIST_ISEMPTY(&dns_resolvers)) {
+			chunk_appendf(&trash, "No resolvers found\n");
+		}
+		else {
+			list_for_each_entry(presolvers, &dns_resolvers, list) {
+				if (appctx->ctx.resolvers.ptr != NULL && appctx->ctx.resolvers.ptr != presolvers)
+					continue;
+
+				chunk_appendf(&trash, "Resolvers section %s\n", presolvers->id);
+				list_for_each_entry(pnameserver, &presolvers->nameserver_list, list) {
+					chunk_appendf(&trash, " nameserver %s:\n", pnameserver->id);
+					chunk_appendf(&trash, "  sent: %ld\n", pnameserver->counters.sent);
+					chunk_appendf(&trash, "  valid: %ld\n", pnameserver->counters.valid);
+					chunk_appendf(&trash, "  update: %ld\n", pnameserver->counters.update);
+					chunk_appendf(&trash, "  cname: %ld\n", pnameserver->counters.cname);
+					chunk_appendf(&trash, "  cname_error: %ld\n", pnameserver->counters.cname_error);
+					chunk_appendf(&trash, "  any_err: %ld\n", pnameserver->counters.any_err);
+					chunk_appendf(&trash, "  nx: %ld\n", pnameserver->counters.nx);
+					chunk_appendf(&trash, "  timeout: %ld\n", pnameserver->counters.timeout);
+					chunk_appendf(&trash, "  refused: %ld\n", pnameserver->counters.refused);
+					chunk_appendf(&trash, "  other: %ld\n", pnameserver->counters.other);
+					chunk_appendf(&trash, "  invalid: %ld\n", pnameserver->counters.invalid);
+					chunk_appendf(&trash, "  too_big: %ld\n", pnameserver->counters.too_big);
+					chunk_appendf(&trash, "  truncated: %ld\n", pnameserver->counters.truncated);
+					chunk_appendf(&trash, "  outdated: %ld\n", pnameserver->counters.outdated);
+				}
+			}
 		}
 
 		/* display response */

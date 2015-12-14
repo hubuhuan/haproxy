@@ -47,7 +47,11 @@ extern struct data_cb si_conn_cb;
 extern struct data_cb si_idle_conn_cb;
 
 struct appctx *stream_int_register_handler(struct stream_interface *si, struct applet *app);
-void si_applet_done(struct stream_interface *si);
+void si_applet_wake_cb(struct stream_interface *si);
+void stream_int_update(struct stream_interface *si);
+void stream_int_update_conn(struct stream_interface *si);
+void stream_int_update_applet(struct stream_interface *si);
+void stream_int_notify(struct stream_interface *si);
 
 /* returns the channel which receives data from this stream interface (input channel) */
 static inline struct channel *si_ic(struct stream_interface *si)
@@ -160,7 +164,7 @@ static inline void si_release_endpoint(struct stream_interface *si)
 		conn_free(conn);
 	}
 	else if ((appctx = objt_appctx(si->end))) {
-		if (appctx->applet->release)
+		if (appctx->applet->release && si->state < SI_ST_DIS)
 			appctx->applet->release(appctx);
 		appctx_free(appctx); /* we share the connection pool */
 	}
@@ -221,28 +225,13 @@ static inline struct appctx *si_appctx(struct stream_interface *si)
 	return objt_appctx(si->end);
 }
 
-/* Call the applet's main function when an appctx is attached to the stream
- * interface. Returns zero if no call was made, or non-zero if a call was made.
- */
-static inline int si_applet_call(struct stream_interface *si)
-{
-	struct appctx *appctx;
-
-	appctx = si_appctx(si);
-	if (appctx) {
-		appctx->applet->fct(appctx);
-		return 1;
-	}
-	return 0;
-}
-
 /* call the applet's release function if any. Needs to be called upon close() */
 static inline void si_applet_release(struct stream_interface *si)
 {
 	struct appctx *appctx;
 
 	appctx = si_appctx(si);
-	if (appctx && appctx->applet->release)
+	if (appctx && appctx->applet->release && si->state < SI_ST_DIS)
 		appctx->applet->release(appctx);
 }
 
@@ -333,10 +322,12 @@ static inline void si_shutw(struct stream_interface *si)
 	si->ops->shutw(si);
 }
 
-/* Calls the data state update on the stream interfaace */
+/* Updates the stream interface and timers, then updates the data layer below */
 static inline void si_update(struct stream_interface *si)
 {
-	si->ops->update(si);
+	stream_int_update(si);
+	if (si->ops->update)
+		si->ops->update(si);
 }
 
 /* Calls chk_rcv on the connection using the data layer */

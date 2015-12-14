@@ -620,6 +620,33 @@ const char *invalid_domainchar(const char *name) {
 struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, int resolve)
 {
 	struct hostent *he;
+	/* max IPv6 length, including brackets and terminating NULL */
+	char tmpip[48];
+
+	/* check IPv6 with square brackets */
+	if (str[0] == '[') {
+		size_t iplength = strlen(str);
+
+		if (iplength < 4) {
+			/* minimal size is 4 when using brackets "[::]" */
+			goto fail;
+		}
+		else if (iplength >= sizeof(tmpip)) {
+			/* IPv6 literal can not be larger than tmpip */
+			goto fail;
+		}
+		else {
+			if (str[iplength - 1] != ']') {
+				/* if address started with bracket, it should end with bracket */
+				goto fail;
+			}
+			else {
+				memcpy(tmpip, str + 1, iplength - 2);
+				tmpip[iplength - 2] = '\0';
+				str = tmpip;
+			}
+		}
+	}
 
 	/* Any IPv6 address */
 	if (str[0] == ':' && str[1] == ':' && !str[2]) {
@@ -665,7 +692,7 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
 		memset(&hints, 0, sizeof(hints));
 		hints.ai_family = sa->ss_family ? sa->ss_family : AF_UNSPEC;
 		hints.ai_socktype = SOCK_DGRAM;
-		hints.ai_flags = AI_PASSIVE;
+		hints.ai_flags = 0;
 		hints.ai_protocol = 0;
 
 		if (getaddrinfo(str, NULL, &hints, &result) == 0) {
@@ -747,18 +774,27 @@ struct sockaddr_storage *str2ip2(const char *str, struct sockaddr_storage *sa, i
  *                  the first byte of the address.
  *    - "fd@"    => an integer must follow, and is a file descriptor number.
  *
- * Also note that in order to avoid any ambiguity with IPv6 addresses, the ':'
- * is mandatory after the IP address even when no port is specified. NULL is
- * returned if the address cannot be parsed. The <low> and <high> ports are
- * always initialized if non-null, even for non-IP families.
+ * IPv6 addresses can be declared with or without square brackets. When using
+ * square brackets for IPv6 addresses, the port separator (colon) is optional.
+ * If not using square brackets, and in order to avoid any ambiguity with
+ * IPv6 addresses, the last colon ':' is mandatory even when no port is specified.
+ * NULL is returned if the address cannot be parsed. The <low> and <high> ports
+ * are always initialized if non-null, even for non-IP families.
  *
  * If <pfx> is non-null, it is used as a string prefix before any path-based
  * address (typically the path to a unix socket).
  *
+ * if <fqdn> is non-null, it will be filled with :
+ *   - a pointer to the FQDN of the server name to resolve if there's one, and
+ *     that the caller will have to free(),
+ *   - NULL if there was an explicit address that doesn't require resolution.
+ *
+ * Hostnames are only resolved if <resolve> is non-null.
+ *
  * When a file descriptor is passed, its value is put into the s_addr part of
  * the address when cast to sockaddr_in and the address family is AF_UNSPEC.
  */
-struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx)
+struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char **err, const char *pfx, char **fqdn, int resolve)
 {
 	static struct sockaddr_storage ss;
 	struct sockaddr_storage *ret = NULL;
@@ -768,10 +804,17 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 	int abstract = 0;
 
 	portl = porth = porta = 0;
+	if (fqdn)
+		*fqdn = NULL;
 
 	str2 = back = env_expand(strdup(str));
 	if (str2 == NULL) {
 		memprintf(err, "out of memory in '%s'\n", __FUNCTION__);
+		goto out;
+	}
+
+	if (!*str2) {
+		memprintf(err, "'%s' resolves to an empty address (environment variable missing?)\n", str);
 		goto out;
 	}
 
@@ -840,15 +883,37 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 		memcpy(((struct sockaddr_un *)&ss)->sun_path + prefix_path_len + abstract, str2, adr_len + 1 - abstract);
 	}
 	else { /* IPv4 and IPv6 */
-		port1 = strrchr(str2, ':');
-		if (port1)
-			*port1++ = '\0';
-		else
-			port1 = "";
+		int use_fqdn = 0;
+		char *end = str2 + strlen(str2);
+		char *chr;
 
-		if (str2ip(str2, &ss) == NULL) {
-			memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
-			goto out;
+		/* search for : or ] whatever comes first */
+		for (chr = end-1; chr > str2; chr--) {
+			if (*chr == ']' || *chr == ':')
+				break;
+		}
+
+		if (*chr == ':') {
+			/* Found a colon before a closing-bracket, must be a port separator.
+			 * This guarantee backward compatibility.
+			 */
+			*chr++ = '\0';
+			port1 = chr;
+		}
+		else {
+			/* Either no colon and no closing-bracket
+			 * or directly ending with a closing-bracket.
+			 * However, no port.
+			 */
+			port1 = "";
+		}
+
+		if (str2ip2(str2, &ss, 0) == NULL) {
+			use_fqdn = 1;
+			if (!resolve || str2ip2(str2, &ss, 1) == NULL) {
+				memprintf(err, "invalid address: '%s' in '%s'\n", str2, str);
+				goto out;
+			}
 		}
 
 		if (isdigit((int)(unsigned char)*port1)) {	/* single port or range */
@@ -874,6 +939,13 @@ struct sockaddr_storage *str2sa_range(const char *str, int *low, int *high, char
 			goto out;
 		}
 		set_host_port(&ss, porta);
+
+		if (use_fqdn && fqdn) {
+			if (str2 != back)
+				memmove(back, str2, strlen(str2) + 1);
+			*fqdn = back;
+			back = NULL;
+		}
 	}
 
 	ret = &ss;
